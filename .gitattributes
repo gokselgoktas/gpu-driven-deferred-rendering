@@ -1,0 +1,10 @@
+*.asset eol=lf linguist-language=yaml merge=unityyamlmerge
+*.compute linguist-language=hlsl text
+*.fbx diff=lfs filter=lfs merge=lfs -text
+*.hlsl linguist-language=hlsl text
+*.json eol=lf linguist-language=json
+*.mat eol=lf linguist-language=yaml merge=unityyamlmerge
+*.meta eol=lf linguist-language=yaml merge=unityyamlmerge
+*.shader text
+*.txt eol=lf text
+*.unity eol=lf linguist-language=yaml merge=unityyamlmerge
