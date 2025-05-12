@@ -1,11 +1,10 @@
 using System;
-using System.Linq;
-using System.Reflection;
 using System.Runtime.InteropServices;
 
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.Rendering.RenderGraphModule;
 
 public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeature
 {
@@ -16,6 +15,26 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
         {
             internal Vector3 Position;
             internal Vector4 Color;
+        }
+
+        private sealed class ComputePassData
+        {
+            internal ComputeShader ComputeShader;
+
+            internal BufferHandle VertexBufferHandle;
+            internal BufferHandle IndexBufferHandle;
+
+            internal BufferHandle IndirectArgumentsBufferHandle;
+        }
+
+        private sealed class RasterRenderPassData
+        {
+            internal BufferHandle VertexBufferHandle;
+            internal BufferHandle IndexBufferHandle;
+
+            internal BufferHandle IndirectArgumentsBufferHandle;
+
+            internal Material Material;
         }
 
         private static readonly int _vertexBufferID = Shader.PropertyToID("_VERTEX_BUFFER");
@@ -32,18 +51,17 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
 
         private Material _material;
 
-        private UniversalRenderer _universalRenderer;
-
-        private object _deferredLights;
-
-        private RTHandle[] _gBufferAttachments;
-        private RTHandle _depthAttachment;
-
         public RenderPass()
         {
 #if UNITY_EDITOR
             UnityEditor.AssemblyReloadEvents.beforeAssemblyReload += OnAssemblyReload;
 #endif
+
+            _vertexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, Marshal.SizeOf(typeof(Vertex)));
+            _indexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, sizeof(uint));
+
+            _indirectArgumentsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1,
+                GraphicsBuffer.IndirectDrawIndexedArgs.size);
         }
 
         ~RenderPass()
@@ -55,18 +73,64 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
             Dispose();
         }
 
-        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
+        private void AddComputePass(RenderGraph renderGraph)
         {
+            if (_vertexBuffer == null || _indexBuffer == null || _indirectArgumentsBuffer == null)
+                return;
+
             if (_computeShader == null)
             {
                 _computeShader = (ComputeShader)Resources.Load("Shaders/GPUDrivenBufferGeneration");
 
                 if (_computeShader == null)
                 {
-                    Debug.LogError("GPUDrivenBufferGeneration.compute not found");
+                    Debug.LogError("GPUDrivenBufferGeneration.compute not found.");
                     return;
                 }
+
+                return;
             }
+
+            using var builder =
+                renderGraph.AddComputePass<ComputePassData>("GPU-Driven Buffer Generation", out var computePassData);
+
+            computePassData.ComputeShader = _computeShader;
+
+            computePassData.VertexBufferHandle = renderGraph.ImportBuffer(_vertexBuffer);
+            builder.UseBuffer(computePassData.VertexBufferHandle, AccessFlags.Write);
+
+            computePassData.IndexBufferHandle = renderGraph.ImportBuffer(_indexBuffer);
+            builder.UseBuffer(computePassData.IndexBufferHandle, AccessFlags.Write);
+
+            computePassData.IndirectArgumentsBufferHandle = renderGraph.ImportBuffer(_indirectArgumentsBuffer);
+            builder.UseBuffer(computePassData.IndirectArgumentsBufferHandle, AccessFlags.Write);
+
+            builder.SetRenderFunc(
+                (ComputePassData computePassData, ComputeGraphContext computeGraphContext) =>
+                {
+                    var cmd = computeGraphContext.cmd;
+                    var computeShader = computePassData.ComputeShader;
+
+                    cmd.SetComputeBufferParam(computeShader, 0, _vertexBufferID, computePassData.VertexBufferHandle);
+                    cmd.SetComputeBufferParam(computeShader, 0, _indexBufferID, computePassData.IndexBufferHandle);
+
+                    cmd.SetComputeBufferParam(computeShader, 0, _indirectArgumentsBufferID,
+                        computePassData.IndirectArgumentsBufferHandle);
+
+                    cmd.DispatchCompute(computePassData.ComputeShader, 0, 1, 1, 1);
+
+                    cmd.SetComputeBufferParam(computeShader, 1, _indirectArgumentsBufferID,
+                        computePassData.IndirectArgumentsBufferHandle);
+
+                    cmd.DispatchCompute(computeShader, 1, 1, 1, 1);
+                }
+            );
+        }
+
+        private void AddRasterRenderPass(RenderGraph renderGraph, ContextContainer frameData)
+        {
+            if (_vertexBuffer == null || _indexBuffer == null || _indirectArgumentsBuffer == null)
+                return;
 
             if (_material == null)
             {
@@ -87,112 +151,47 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
                 }
             }
 
-            _vertexBuffer ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, Marshal.SizeOf(typeof(Vertex)));
-            _indexBuffer ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, sizeof(uint));
+            using var builder = renderGraph.AddRasterRenderPass<RasterRenderPassData>(
+                "GPU-Driven Deferred Rendering", out var rasterRenderPassData);
 
-            _indirectArgumentsBuffer ??= new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1,
-                GraphicsBuffer.IndirectDrawIndexedArgs.size);
+            var universalResourceData = frameData.Get<UniversalResourceData>();
+            var gBuffer = universalResourceData.gBuffer;
+
+            for (int i = 0; i < gBuffer.Length; ++i)
+                builder.SetRenderAttachment(gBuffer[i], i);
+
+            builder.SetRenderAttachmentDepth(universalResourceData.cameraDepth);
+
+            rasterRenderPassData.VertexBufferHandle = renderGraph.ImportBuffer(_vertexBuffer);
+            rasterRenderPassData.IndexBufferHandle = renderGraph.ImportBuffer(_indexBuffer);
+
+            rasterRenderPassData.IndirectArgumentsBufferHandle = renderGraph.ImportBuffer(_indirectArgumentsBuffer);
+
+            rasterRenderPassData.Material = _material;
+
+            builder.UseBuffer(rasterRenderPassData.VertexBufferHandle, AccessFlags.Read);
+            builder.UseBuffer(rasterRenderPassData.IndexBufferHandle, AccessFlags.Read);
+
+            builder.UseBuffer(rasterRenderPassData.IndirectArgumentsBufferHandle, AccessFlags.Read);
+
+            builder.SetRenderFunc(
+                (RasterRenderPassData rasterRenderPassData, RasterGraphContext rasterGraphContext) =>
+                {
+                    var cmd = rasterGraphContext.cmd;
+                    var material = rasterRenderPassData.Material;
+
+                    material.SetBuffer(_vertexBufferID, rasterRenderPassData.VertexBufferHandle);
+
+                    cmd.DrawProceduralIndirect(rasterRenderPassData.IndexBufferHandle, Matrix4x4.identity, material, 0,
+                        MeshTopology.Triangles, rasterRenderPassData.IndirectArgumentsBufferHandle, 0);
+                }
+            );
         }
 
-        private void ConfigureGBuffer(ScriptableRenderer scriptableRenderer)
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
         {
-            if (_universalRenderer != scriptableRenderer)
-            {
-                if (scriptableRenderer is not UniversalRenderer universalRenderer)
-                {
-                    Debug.LogError("ScriptableRenderer is not UniversalRenderer");
-                    return;
-                }
-
-                _universalRenderer = universalRenderer;
-            }
-
-            if (_universalRenderer == null)
-            {
-                Debug.LogError("UniversalRenderer is null");
-                return;
-            }
-
-            if (_deferredLights == null)
-            {
-                var field = typeof(UniversalRenderer).GetField("m_DeferredLights",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-
-                if (field == null)
-                {
-                    Debug.LogError("UniversalRenderer.m_DeferredLights not found");
-                    return;
-                }
-
-                _deferredLights = field.GetValue(_universalRenderer);
-            }
-
-            if (_deferredLights == null)
-            {
-                Debug.LogError("UniversalRenderer.m_DeferredLights is null");
-                return;
-            }
-
-            if (_gBufferAttachments == null)
-            {
-                var type = _deferredLights.GetType();
-                var property = type.GetProperty("GbufferAttachments", BindingFlags.NonPublic | BindingFlags.Instance);
-
-                if (property == null)
-                {
-                    Debug.LogError("DeferredLights.GbufferAttachments not found");
-                    return;
-                }
-
-                _gBufferAttachments = property.GetValue(_deferredLights) as RTHandle[];
-            }
-
-            if (_depthAttachment?.referenceSize != _gBufferAttachments?.First()?.referenceSize)
-                _depthAttachment = null;
-
-            if (_depthAttachment == null)
-            {
-                var type = _deferredLights.GetType();
-                var property = type.GetProperty("DepthAttachment", BindingFlags.NonPublic | BindingFlags.Instance);
-
-                if (property == null)
-                {
-                    Debug.LogError("DeferredLights.DepthAttachment not found");
-                    return;
-                }
-
-                _depthAttachment = property.GetValue(_deferredLights) as RTHandle;
-            }
-
-            ConfigureTarget(_gBufferAttachments, _depthAttachment);
-        }
-
-        public override void Execute(ScriptableRenderContext scriptableRenderContext, ref RenderingData renderingData)
-        {
-            if (_computeShader == null || _vertexBuffer == null || _indirectArgumentsBuffer == null)
-                return;
-
-            var cmd = CommandBufferPool.Get("GPU-Driven Rendering");
-            var scriptableRenderer = renderingData.cameraData.renderer;
-
-            cmd.SetComputeBufferParam(_computeShader, 0, _vertexBufferID, _vertexBuffer);
-            cmd.SetComputeBufferParam(_computeShader, 0, _indexBufferID, _indexBuffer);
-
-            cmd.DispatchCompute(_computeShader, 0, 1, 1, 1);
-
-            cmd.SetComputeBufferParam(_computeShader, 1, _indirectArgumentsBufferID, _indirectArgumentsBuffer);
-
-            cmd.DispatchCompute(_computeShader, 1, 1, 1, 1);
-
-            ConfigureGBuffer(scriptableRenderer);
-
-            _material.SetBuffer(_vertexBufferID, _vertexBuffer);
-
-            cmd.DrawProceduralIndirect(_indexBuffer, Matrix4x4.identity, _material, 0, MeshTopology.Triangles,
-                _indirectArgumentsBuffer, 0);
-
-            scriptableRenderContext.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
+            AddComputePass(renderGraph);
+            AddRasterRenderPass(renderGraph, frameData);
         }
 
 #if UNITY_EDITOR
@@ -205,19 +204,18 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
         private void Dispose()
         {
             _vertexBuffer?.Release();
-            _vertexBuffer = null;
-
             _indexBuffer?.Release();
-            _indexBuffer = null;
 
             _indirectArgumentsBuffer?.Release();
+
+            DestroyImmediate(_material);
+
+            _vertexBuffer = null;
+            _indexBuffer = null;
+
             _indirectArgumentsBuffer = null;
 
-            if (_material != null)
-            {
-                CoreUtils.Destroy(_material);
-                _material = null;
-            }
+            _material = null;
         }
     }
 
@@ -227,14 +225,12 @@ public sealed class GPUDrivenDeferredRenderingFeature : ScriptableRendererFeatur
     {
         _renderPass = new()
         {
-            renderPassEvent = RenderPassEvent.AfterRenderingGbuffer
+            renderPassEvent = RenderPassEvent.AfterRenderingGbuffer,
         };
     }
 
-    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+    public override void AddRenderPasses(ScriptableRenderer scriptableRenderer, ref RenderingData renderingData)
     {
-        _ = renderingData;
-
-        renderer.EnqueuePass(_renderPass);
+        scriptableRenderer.EnqueuePass(_renderPass);
     }
 }
